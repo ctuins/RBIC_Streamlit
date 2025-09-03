@@ -12,7 +12,7 @@ USDA_LAYER_RBS = 2                 # layer 2 = RBS ineligible polygons
 TIMEOUT = 25
 SLEEP_ON_LIMIT = 2.0
 
-# If a single full-address column exists, we can use it instead of parts.
+# Allow a single full-address column instead of parts
 FULL_ADDRESS_CANDIDATES = [
     # Grata
     "mailing address"
@@ -73,7 +73,7 @@ st.caption("Upload an Excel (.xlsx). We geocode with Google, check USDA RBS poly
 API_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", os.getenv("GOOGLE_MAPS_API_KEY", ""))
 
 # =========================
-# Helper functions
+# Helpers
 # =========================
 def _canon(name: str) -> str:
     k = str(name).strip().lower()
@@ -83,58 +83,39 @@ def _coalesce_str(series: pd.Series) -> pd.Series:
     return series.astype(str).replace({"<NA>": "", "nan": "", "None": None}).fillna("").str.strip()
 
 def _first_nonempty_rowwise(df_sub: pd.DataFrame) -> pd.Series:
-    """
-    For multiple candidate columns (all strings), return the first non-empty per row.
-    Ensures the result is a Series (so .str works later).
-    """
+    """Take first non-empty value per row across given columns; returns a Series."""
     if df_sub.shape[1] == 0:
         return pd.Series([""] * len(df_sub), index=df_sub.index)
-    # normalize to strings and strip
     norm = df_sub.apply(lambda s: s.astype(str).str.strip())
-    # pick first non-empty per row
     return norm.apply(lambda row: next((v for v in row if v not in ("", "nan", "None")), ""), axis=1)
 
 @st.cache_data(show_spinner=False)
 def _load_excel(bytes_) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(bytes_), dtype=str, engine="openpyxl")
-
-    # Canonicalize headers
     df.columns = [_canon(c) for c in df.columns]
 
-    # --- Deduplicate columns that canonicalized to the same name ---
-    # Build a mapping from canonical name -> list of columns with that name
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for c in df.columns:
-        buckets[c].append(c)
-
-    # For key fields we expect to use string ops later, coalesce duplicates to a single Series
+    # Coalesce duplicates that canonicalized to the same name (so we always have Series, not DataFrames)
     for key in ["address_full", "street", "city", "state", "zip", "company", "id"]:
         dup_cols = [c for c in df.columns if c == key]
         if len(dup_cols) > 1:
-            # coalesce and replace with a single column
             s = _first_nonempty_rowwise(df.loc[:, dup_cols])
-            # drop all duplicates then reassign one column
             df.drop(columns=dup_cols, inplace=True)
             df[key] = s
 
     cols = set(df.columns)
 
-    # Prefer an existing non-empty 'address_full'
+    # Prefer non-empty address_full if present; else promote a candidate
     has_full_col = ("address_full" in cols) and _coalesce_str(df["address_full"]).ne("").any()
-
-    # Classic 4-part format present?
-    required_parts = {"street", "city", "state", "zip"}
-    has_parts = required_parts.issubset(cols)
-
-    # If neither, try to promote any candidate to 'address_full'
-    if not (has_full_col or has_parts):
+    if not has_full_col:
         for cand in FULL_ADDRESS_CANDIDATES:
             if cand in cols and _coalesce_str(df[cand]).ne("").any():
                 df["address_full"] = df[cand]
                 has_full_col = True
                 break
 
+    # If neither full nor parts exist -> helpful error
+    required_parts = {"street", "city", "state", "zip"}
+    has_parts = required_parts.issubset(set(df.columns))
     if not (has_full_col or has_parts):
         present = ", ".join(df.columns)
         raise ValueError(
@@ -144,13 +125,13 @@ def _load_excel(bytes_) -> pd.DataFrame:
             f"Present columns: [{present}]"
         )
 
-    # Ensure optional columns
-    if "id" not in cols:
+    # Ensure optional
+    if "id" not in df.columns:
         df["id"] = np.arange(1, len(df) + 1).astype(str)
-    if "company" not in cols:
+    if "company" not in df.columns:
         df["company"] = ""
 
-    # Normalize/derive ZIP (always Series)
+    # Derive/normalize ZIP (not strictly required in full-address mode)
     if "zip" in df.columns:
         df["zip"] = _coalesce_str(df["zip"]).str.extract(r"(\d{5})", expand=False)
     elif has_full_col:
@@ -161,7 +142,6 @@ def _load_excel(bytes_) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 def google_geocode(address: str):
-    """Geocode with Google; return (lon, lat) or None."""
     if not API_KEY:
         return None
     url = "https://maps.googleapis.com/maps/api/geocode/json"
@@ -189,7 +169,6 @@ def google_geocode(address: str):
     return None
 
 def usda_in_ineligible(lon: float, lat: float, layer_id: int = USDA_LAYER_RBS) -> bool:
-    """Return True if inside an ineligible polygon."""
     url = f"{USDA_BASE}/{layer_id}/query"
     geometry = json.dumps({"x": float(lon), "y": float(lat), "spatialReference": {"wkid": 4326}})
     params = {
@@ -219,44 +198,60 @@ run = st.button("Process file", type="primary")
 
 if run:
     if upload is None:
-        st.warning("Please upload an .xlsx file first.")
-        st.stop()
+        st.warning("Please upload an .xlsx file first."); st.stop()
 
     if not API_KEY:
-        st.error("GOOGLE_MAPS_API_KEY is not set. Add it in the app’s Settings → Secrets and rerun.")
-        st.stop()
+        st.error("GOOGLE_MAPS_API_KEY is not set. Add it in the app’s Settings → Secrets and rerun."); st.stop()
 
     with st.spinner("Processing…"):
         try:
             df = _load_excel(upload.read())
         except Exception as e:
-            st.error(str(e))
-            st.stop()
+            st.error(str(e)); st.stop()
 
-        # Ensure required part columns exist (even if source only had full address)
+        # Ensure expected columns exist even in full-address mode (for consistent outputs)
         for col in ["street", "city", "state", "zip"]:
             if col not in df.columns:
                 df[col] = ""
 
-        # -------- Row-level validation & bad-rows export (Series-safe) --------
-        required_per_row = ["street", "city", "state", "zip"]
-        missing_mask = df[required_per_row].isna()
-        blank_mask = df[required_per_row].apply(lambda s: s.fillna("").astype(str).str.strip().eq(""))
-        bad_mask = missing_mask.any(axis=1) | blank_mask.any(axis=1)
+        # ---------- Build full_address FIRST ----------
+        has_address_full = ("address_full" in df.columns) and _coalesce_str(df["address_full"]).ne("").any()
+        if has_address_full:
+            df["full_address"] = _coalesce_str(df["address_full"])
+            mode = "full"
+        elif all(c in df.columns for c in ["street", "city", "state", "zip"]):
+            street_s = _coalesce_str(df["street"])
+            city_s   = _coalesce_str(df["city"])
+            state_s  = _coalesce_str(df["state"])
+            zip_s    = _coalesce_str(df["zip"]).str.extract(r"(\d{5})", expand=False).fillna("")
+            df["full_address"] = (street_s + ", " + city_s + ", " + state_s + " " + zip_s).str.strip()
+            mode = "parts"
+        else:
+            st.error("Cannot construct full_address; missing both full-address and parts."); st.stop()
+
+        # ---------- Validation depends on mode ----------
+        if mode == "full":
+            # Only require 'full_address' to be non-empty
+            bad_mask = df["full_address"].astype(str).str.strip().eq("")
+        else:  # parts mode
+            required_per_row = ["street", "city", "state", "zip"]
+            missing_mask = df[required_per_row].isna()
+            blank_mask = df[required_per_row].apply(lambda s: s.fillna("").astype(str).str.strip().eq(""))
+            bad_mask = missing_mask.any(axis=1) | blank_mask.any(axis=1)
 
         df_bad = df.loc[bad_mask].copy()
         df_good = df.loc[~bad_mask].copy()
 
         if len(df_bad) > 0:
             st.warning(
-                f"{len(df_bad)} row(s) are missing required fields or a valid 5-digit ZIP. "
+                f"{len(df_bad)} row(s) are missing required address info for this mode ({mode}). "
                 "They’ll be skipped here. Download to fix and re-upload."
             )
             bad_csv = df_bad.to_csv(index=False).encode()
             st.download_button("Download problematic rows (CSV)", data=bad_csv,
                                file_name="rows_to_fix.csv", mime="text/csv")
 
-        # Work with good rows for geocoding
+        # Work with good rows
         df = df_good.reset_index(drop=True)
 
         # Prep derived columns
@@ -265,18 +260,9 @@ if run:
         df["lat"] = np.nan
         df["eligible_rbs"] = None
 
-        # Build full_address from either a provided full-address field or the parts
-        if "address_full" in df.columns and _coalesce_str(df["address_full"]).ne("").any():
-            df["full_address"] = _coalesce_str(df["address_full"])
-        else:
-            street_s = _coalesce_str(df["street"])
-            city_s   = _coalesce_str(df["city"])
-            state_s  = _coalesce_str(df["state"])
-            zip_s    = _coalesce_str(df["zip"]).str.extract(r"(\d{5})", expand=False).fillna("")
-            df["full_address"] = (street_s + ", " + city_s + ", " + state_s + " " + zip_s).str.strip()
-
-        # Optional: debug view
+        # Debug view
         with st.expander("Detected columns (debug)"):
+            st.write({"mode": mode})
             st.write(sorted(df.columns))
             st.write(df.head(3))
 
@@ -302,7 +288,7 @@ if run:
             except Exception:
                 df.at[i, "eligible_rbs"] = None
 
-        # Output columns (ensure present)
+        # Output columns
         out_cols = ["id","company","street","city","state","zip","lon","lat","geocode_success","eligible_rbs"]
         for c in out_cols:
             if c not in df.columns:
@@ -317,7 +303,6 @@ if run:
         with c4: st.metric("Ineligible", int((df["eligible_rbs"] == False).sum()))
         with c5: st.metric("No result", int(len(df) - (df["eligible_rbs"] == True).sum() - (df["eligible_rbs"] == False).sum()))
 
-        # Streamlit deprecation fix
         st.dataframe(df[out_cols], width='stretch')
 
         # Downloads
@@ -343,5 +328,5 @@ with st.expander("About & caveats"):
     - Geocoding uses Google Maps Geocoding API. Set `GOOGLE_MAPS_API_KEY` in the app’s **Settings → Secrets**.
     - `eligible_rbs = True` means the point is **not** inside an RBS ineligible polygon.
     - Accepts classic 4-part addresses, Grata (Headquarters/Mailing Address), and PitchBook (HQ Location or HQ Address Line 1/City/State/Post Code).
-    - Rows missing required fields get offered as a separate CSV to fix.
+    - Validation adapts to the detected mode: full-address OR parts.
     """)
