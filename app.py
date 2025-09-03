@@ -8,19 +8,17 @@ import streamlit as st
 # Config
 # =========================
 USDA_BASE = "https://rdgdwe.sc.egov.usda.gov/arcgis/rest/services/Eligibility/Eligibility/MapServer"
-USDA_LAYER_RBS = 2                 # RBS ineligible polygons (layer 2 = ineligible)
+USDA_LAYER_RBS = 2                 # layer 2 = RBS ineligible polygons
 TIMEOUT = 25
-SLEEP_ON_LIMIT = 2.0               # backoff if Google returns OVER_QUERY_LIMIT
+SLEEP_ON_LIMIT = 2.0
 
 # If a single full-address column exists, we can use it instead of parts.
 FULL_ADDRESS_CANDIDATES = [
     # Grata
-    "mailing address", "headquarters", "hq address", "location", "full address",
-    # PitchBook
-    "hq location",
+    "mailing address"
 ]
 
-# Base aliases (original)
+# Base aliases
 ALIASES = {
     # company/name
     "company": "company",
@@ -36,9 +34,9 @@ ALIASES = {
     "zipcode": "zip", "zip_code": "zip", "postal": "zip", "postal_code": "zip", "province": "state",
 }
 
-# Extend aliases for Grata + PitchBook + convenience
+# Extend aliases for Grata + PitchBook
 ALIASES.update({
-    # IDs / names / links
+    # ids / names / links
     "company id": "id",
     "companies": "company",
     "name": "company",
@@ -55,7 +53,7 @@ ALIASES.update({
     "hq postcode": "zip",
     "hq postal code": "zip",
 
-    # Full-address fields (normalize to one name)
+    # full-address fields -> unified name
     "mailing address": "address_full",
     "headquarters": "address_full",
     "hq address": "address_full",
@@ -63,7 +61,7 @@ ALIASES.update({
     "full address": "address_full",
     "hq location": "address_full",
 
-    # Optional metadata (kept if present; not required)
+    # optional metadata
     "hq country/territory/region": "country",
     "primary industry code": "industry_code",
 })
@@ -72,40 +70,67 @@ st.set_page_config(page_title="USDA RBS Eligibility Checker", layout="wide")
 st.title("USDA RBS Eligibility Checker")
 st.caption("Upload an Excel (.xlsx). We geocode with Google, check USDA RBS polygons, and return results.")
 
-# Prefer secrets (Streamlit Cloud) but allow env var fallback
 API_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", os.getenv("GOOGLE_MAPS_API_KEY", ""))
 
-
 # =========================
-# Helpers
+# Helper functions
 # =========================
-def _canon(col_name: str) -> str:
-    """Normalize a header using ALIASES (case/space-insensitive)."""
-    k = str(col_name).strip().lower()
+def _canon(name: str) -> str:
+    k = str(name).strip().lower()
     return ALIASES.get(k, k)
 
 def _coalesce_str(series: pd.Series) -> pd.Series:
-    """Return a string, trimmed, with NaNs -> ''."""
-    return series.fillna("").astype(str).str.strip()
+    return series.astype(str).replace({"<NA>": "", "nan": "", "None": None}).fillna("").str.strip()
+
+def _first_nonempty_rowwise(df_sub: pd.DataFrame) -> pd.Series:
+    """
+    For multiple candidate columns (all strings), return the first non-empty per row.
+    Ensures the result is a Series (so .str works later).
+    """
+    if df_sub.shape[1] == 0:
+        return pd.Series([""] * len(df_sub), index=df_sub.index)
+    # normalize to strings and strip
+    norm = df_sub.apply(lambda s: s.astype(str).str.strip())
+    # pick first non-empty per row
+    return norm.apply(lambda row: next((v for v in row if v not in ("", "nan", "None")), ""), axis=1)
 
 @st.cache_data(show_spinner=False)
 def _load_excel(bytes_) -> pd.DataFrame:
-    """Load and normalize an .xlsx into a DataFrame with flexible headers."""
     df = pd.read_excel(io.BytesIO(bytes_), dtype=str, engine="openpyxl")
+
+    # Canonicalize headers
     df.columns = [_canon(c) for c in df.columns]
+
+    # --- Deduplicate columns that canonicalized to the same name ---
+    # Build a mapping from canonical name -> list of columns with that name
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for c in df.columns:
+        buckets[c].append(c)
+
+    # For key fields we expect to use string ops later, coalesce duplicates to a single Series
+    for key in ["address_full", "street", "city", "state", "zip", "company", "id"]:
+        dup_cols = [c for c in df.columns if c == key]
+        if len(dup_cols) > 1:
+            # coalesce and replace with a single column
+            s = _first_nonempty_rowwise(df.loc[:, dup_cols])
+            # drop all duplicates then reassign one column
+            df.drop(columns=dup_cols, inplace=True)
+            df[key] = s
+
     cols = set(df.columns)
 
     # Prefer an existing non-empty 'address_full'
-    has_full_col = ("address_full" in cols) and df["address_full"].astype(str).str.strip().ne("").any()
+    has_full_col = ("address_full" in cols) and _coalesce_str(df["address_full"]).ne("").any()
 
     # Classic 4-part format present?
     required_parts = {"street", "city", "state", "zip"}
     has_parts = required_parts.issubset(cols)
 
-    # If neither, try to promote a candidate to 'address_full'
+    # If neither, try to promote any candidate to 'address_full'
     if not (has_full_col or has_parts):
         for cand in FULL_ADDRESS_CANDIDATES:
-            if cand in cols and df[cand].astype(str).str.strip().ne("").any():
+            if cand in cols and _coalesce_str(df[cand]).ne("").any():
                 df["address_full"] = df[cand]
                 has_full_col = True
                 break
@@ -125,7 +150,7 @@ def _load_excel(bytes_) -> pd.DataFrame:
     if "company" not in cols:
         df["company"] = ""
 
-    # Normalize/derive ZIP
+    # Normalize/derive ZIP (always Series)
     if "zip" in df.columns:
         df["zip"] = _coalesce_str(df["zip"]).str.extract(r"(\d{5})", expand=False)
     elif has_full_col:
@@ -182,7 +207,6 @@ def usda_in_ineligible(lon: float, lat: float, layer_id: int = USDA_LAYER_RBS) -
     data = r.json()
     return len(data.get("features", [])) > 0
 
-
 # =========================
 # UI
 # =========================
@@ -198,29 +222,25 @@ if run:
         st.warning("Please upload an .xlsx file first.")
         st.stop()
 
-    # Preflight: key required
     if not API_KEY:
         st.error("GOOGLE_MAPS_API_KEY is not set. Add it in the app’s Settings → Secrets and rerun.")
         st.stop()
 
     with st.spinner("Processing…"):
-        # Load + normalize headers
         try:
             df = _load_excel(upload.read())
         except Exception as e:
             st.error(str(e))
             st.stop()
 
-        # Ensure columns exist even if source only had a full address
+        # Ensure required part columns exist (even if source only had full address)
         for col in ["street", "city", "state", "zip"]:
             if col not in df.columns:
                 df[col] = ""
 
-        # -------- Row-level validation & bad-rows export (NO .str on DataFrame!) --------
+        # -------- Row-level validation & bad-rows export (Series-safe) --------
         required_per_row = ["street", "city", "state", "zip"]
-        # Missing mask
         missing_mask = df[required_per_row].isna()
-        # Blank-string mask (strip per column)
         blank_mask = df[required_per_row].apply(lambda s: s.fillna("").astype(str).str.strip().eq(""))
         bad_mask = missing_mask.any(axis=1) | blank_mask.any(axis=1)
 
@@ -233,7 +253,8 @@ if run:
                 "They’ll be skipped here. Download to fix and re-upload."
             )
             bad_csv = df_bad.to_csv(index=False).encode()
-            st.download_button("Download problematic rows (CSV)", data=bad_csv, file_name="rows_to_fix.csv", mime="text/csv")
+            st.download_button("Download problematic rows (CSV)", data=bad_csv,
+                               file_name="rows_to_fix.csv", mime="text/csv")
 
         # Work with good rows for geocoding
         df = df_good.reset_index(drop=True)
@@ -245,7 +266,7 @@ if run:
         df["eligible_rbs"] = None
 
         # Build full_address from either a provided full-address field or the parts
-        if "address_full" in df.columns and df["address_full"].astype(str).str.strip().ne("").any():
+        if "address_full" in df.columns and _coalesce_str(df["address_full"]).ne("").any():
             df["full_address"] = _coalesce_str(df["address_full"])
         else:
             street_s = _coalesce_str(df["street"])
@@ -254,12 +275,12 @@ if run:
             zip_s    = _coalesce_str(df["zip"]).str.extract(r"(\d{5})", expand=False).fillna("")
             df["full_address"] = (street_s + ", " + city_s + ", " + state_s + " " + zip_s).str.strip()
 
-        # Optional: show detected columns
+        # Optional: debug view
         with st.expander("Detected columns (debug)"):
             st.write(sorted(df.columns))
             st.write(df.head(3))
 
-        # Geocode (cached by full address)
+        # Geocode (cached)
         cache = {}
         for i, r in df.iterrows():
             a = r["full_address"]
@@ -296,7 +317,7 @@ if run:
         with c4: st.metric("Ineligible", int((df["eligible_rbs"] == False).sum()))
         with c5: st.metric("No result", int(len(df) - (df["eligible_rbs"] == True).sum() - (df["eligible_rbs"] == False).sum()))
 
-        # NOTE: Streamlit deprecation fix — use width='stretch' instead of use_container_width
+        # Streamlit deprecation fix
         st.dataframe(df[out_cols], width='stretch')
 
         # Downloads
