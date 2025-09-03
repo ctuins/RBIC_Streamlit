@@ -12,16 +12,47 @@ SLEEP_ON_LIMIT = 2.0               # backoff if Google returns OVER_QUERY_LIMIT
 
 REQUIRED = {"street","city","state","zip"}
 OPTIONAL = {"id","company"}
-ALIASES = {
-    # direct mapping
-    "company":"company",
-    "address":"street","address1":"street","addr":"street","street address":"street",
-    "zipcode":"zip","zip_code":"zip","postal":"zip","postal_code":"zip","province":"state",
-    # common company variants
-    "company name":"company","company_name":"company","business":"company","business name":"company",
-    "firm":"company","organization":"company","organisation":"company","org":"company",
-    "client":"company","customer":"company"
-}
+# Accept a single full-address column if present
+FULL_ADDRESS_CANDIDATES = [
+    # Grata
+    "mailing address"
+]
+
+# Expand aliases to cover Grata + PitchBook headers
+ALIASES.update({
+    # Common company/id
+    "company id": "id",
+    "companies": "company",
+    "name": "company",
+    "website": "domain",
+    "view company online": "source_link",
+    "grata link": "source_link",
+
+    # Classic address parts (more variants)
+    "address1": "street",
+    "address line 1": "street",
+
+    # PitchBook address parts
+    "hq address line 1": "street",
+    "hq city": "city",
+    "hq state/province": "state",
+    "hq state": "state",
+    "hq post code": "zip",
+    "hq postcode": "zip",
+    "hq postal code": "zip",
+
+    # Full-address fields → normalize to address_full
+    "mailing address": "address_full",
+    "headquarters": "address_full",
+    "hq address": "address_full",
+    "location": "address_full",
+    "full address": "address_full",
+    "hq location": "address_full",
+
+    # Optional metadata if you want later
+    "hq country/territory/region": "country",
+    "primary industry code": "industry_code",
+})
 
 st.set_page_config(page_title="USDA RBS Eligibility Checker", layout="wide")
 st.title("USDA RBS Eligibility Checker")
