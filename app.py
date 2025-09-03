@@ -12,9 +12,9 @@ USDA_LAYER_RBS = 2                 # layer 2 = RBS ineligible polygons
 TIMEOUT = 25
 SLEEP_ON_LIMIT = 2.0
 
-# IMPORTANT: Full-address mode will ONLY use "Mailing Address"
-# No HQ fields are considered as full address.
-# (HQ Address Line 1, etc. are still accepted as "parts" if present.)
+# IMPORTANT: Full-address mode will ONLY use "Mailing Address".
+# HQ-style columns are NOT used as a full address.
+# (PitchBook HQ Address Line 1 etc. are accepted as PARTS when present.)
 ALIASES = {
     # company/name
     "company": "company",
@@ -34,7 +34,7 @@ ALIASES = {
     "address": "street", "address1": "street", "addr": "street", "street address": "street",
     "address line 1": "street",
 
-    # pitchbook parts (still treated as parts, not full)
+    # pitchbook parts (treated as parts, not full)
     "hq address line 1": "street",
     "hq city": "city",
     "hq state/province": "state",
@@ -48,6 +48,7 @@ ALIASES = {
 
     # FULL MODE: ONLY mailing address is allowed as full-address
     "mailing address": "address_full",
+
     # NOTE: intentionally NOT mapping any of these to full:
     # "headquarters", "hq address", "hq location", "location", "full address"
 }
@@ -56,7 +57,9 @@ st.set_page_config(page_title="USDA RBS Eligibility Checker", layout="wide")
 st.title("USDA RBS Eligibility Checker")
 st.caption("Upload an Excel (.xlsx). We geocode with Google, check USDA RBS polygons, and return results.")
 
+# Prefer secrets (Streamlit Cloud) but allow env var fallback
 API_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", os.getenv("GOOGLE_MAPS_API_KEY", ""))
+
 
 # =========================
 # Helpers
@@ -81,12 +84,20 @@ def _first_nonempty_rowwise(df_sub: pd.DataFrame) -> pd.Series:
     norm = df_sub.apply(_norm_series)
     return norm.apply(lambda row: next((v for v in row if v != ""), ""), axis=1)
 
+def _comp(components, type_name, short=True):
+    """Extract an address component by Google type (e.g., 'locality', 'postal_code')."""
+    for c in components or []:
+        if type_name in c.get("types", []):
+            return c.get("short_name" if short else "long_name", "")
+    return ""
+
 @st.cache_data(show_spinner=False)
 def _load_excel(bytes_) -> pd.DataFrame:
+    """Load and normalize .xlsx; coalesce canonical duplicates to avoid DataFrame .str errors."""
     df = pd.read_excel(io.BytesIO(bytes_), dtype=str, engine="openpyxl")
     df.columns = [_canon(c) for c in df.columns]
 
-    # Coalesce duplicates so each canonical name is a Series (prevents .str errors)
+    # Coalesce duplicates so each canonical name is a Series
     for key in ["company","id","street","city","state","zip","address_full"]:
         dup = [c for c in df.columns if c == key]
         if len(dup) > 1:
@@ -105,13 +116,17 @@ def _load_excel(bytes_) -> pd.DataFrame:
         if c in df.columns:
             df[c] = _norm_series(df[c])
 
-    # Derive/normalize ZIP (not strictly required in full mode, but helpful)
+    # Derive/normalize ZIP (helpful even in full mode)
     if "zip" in df.columns:
         df["zip"] = df["zip"].str.extract(r"(\d{5})", expand=False)
 
     return df.reset_index(drop=True)
 
 def google_geocode(address: str):
+    """
+    Geocode with Google; return dict with lon/lat/formatted/components, or None.
+    Also used to backfill parts when starting from a full address.
+    """
     if not API_KEY:
         return None
     url = "https://maps.googleapis.com/maps/api/geocode/json"
@@ -122,8 +137,16 @@ def google_geocode(address: str):
             data = resp.json()
             status = data.get("status", "")
             if status == "OK":
-                loc = data["results"][0]["geometry"]["location"]
-                return float(loc["lng"]), float(loc["lat"])
+                res = data["results"][0]
+                loc = res["geometry"]["location"]
+                formatted = res.get("formatted_address", "")
+                comps = res.get("address_components", [])
+                return {
+                    "lon": float(loc["lng"]),
+                    "lat": float(loc["lat"]),
+                    "formatted": formatted,
+                    "components": comps,
+                }
             elif status in ("OVER_QUERY_LIMIT", "RESOURCE_EXHAUSTED"):
                 time.sleep(SLEEP_ON_LIMIT * attempt); continue
             elif status in ("ZERO_RESULTS", "INVALID_REQUEST", "REQUEST_DENIED", "UNKNOWN_ERROR"):
@@ -155,6 +178,7 @@ def usda_in_ineligible(lon: float, lat: float, layer_id: int = USDA_LAYER_RBS) -
     data = r.json()
     return len(data.get("features", [])) > 0
 
+
 # =========================
 # UI
 # =========================
@@ -177,15 +201,14 @@ if run:
         except Exception as e:
             st.error(str(e)); st.stop()
 
-        # Ensure expected columns exist (for consistent output)
+        # Ensure consistent output columns exist
         for col in ["street", "city", "state", "zip"]:
             if col not in df.columns:
                 df[col] = ""
 
-        # ---------- Build full_address using ONLY mailing address if provided ----------
+        # ---------- Build full_address using ONLY Mailing Address if present ----------
         has_full = ("address_full" in df.columns) and df["address_full"].str.strip().ne("").any()
         if has_full:
-            # Use mailing address as the full address string
             df["full_address"] = df["address_full"].str.replace(r"[\r\n]+", ", ", regex=True).str.strip()
             mode = "full"   # mailing-address-only full mode
         elif all(c in df.columns for c in ["street","city","state","zip"]):
@@ -200,6 +223,10 @@ if run:
             mode = "parts"
         else:
             st.error("Could not find a 'Mailing Address' column or the 4 parts (street/city/state/zip)."); st.stop()
+
+        # Show both input and Google-formatted address in outputs
+        df["input_address"] = df["full_address"]
+        df["formatted_address"] = ""  # filled after geocoding
 
         # ---------- Validation depends on mode ----------
         if mode == "full":
@@ -249,8 +276,24 @@ if run:
                 ll = google_geocode(a)
                 cache[a] = ll
             if ll:
-                df.at[i, "lon"], df.at[i, "lat"] = ll
+                df.at[i, "lon"] = ll["lon"]
+                df.at[i, "lat"] = ll["lat"]
                 df.at[i, "geocode_success"] = True
+                df.at[i, "formatted_address"] = ll["formatted"]
+
+                # Backfill parts if they were blank (nice for full mode)
+                if not str(df.at[i, "city"]).strip():
+                    df.at[i, "city"]  = _comp(ll["components"], "locality") or _comp(ll["components"], "sublocality")
+                if not str(df.at[i, "state"]).strip():
+                    df.at[i, "state"] = _comp(ll["components"], "administrative_area_level_1", short=True)
+                if not str(df.at[i, "zip"]).strip():
+                    df.at[i, "zip"]   = _comp(ll["components"], "postal_code", short=True)
+                if not str(df.at[i, "street"]).strip():
+                    num  = _comp(ll["components"], "street_number", short=False)
+                    rt   = _comp(ll["components"], "route", short=False)
+                    street = f"{num} {rt}".strip()
+                    if street:
+                        df.at[i, "street"] = street
 
         # USDA check
         for i, r in df.iterrows():
@@ -262,8 +305,13 @@ if run:
             except Exception:
                 df.at[i, "eligible_rbs"] = None
 
-        # Output columns (ensure present)
-        out_cols = ["id","company","street","city","state","zip","lon","lat","geocode_success","eligible_rbs"]
+        # Output columns (now include input/formatted address)
+        out_cols = [
+            "id","company",
+            "input_address","formatted_address",
+            "street","city","state","zip",
+            "lon","lat","geocode_success","eligible_rbs"
+        ]
         for c in out_cols:
             if c not in df.columns:
                 df[c] = "" if c not in ["lon","lat","geocode_success","eligible_rbs"] else np.nan
@@ -292,7 +340,8 @@ if run:
 
 with st.expander("About & caveats"):
     st.write("""
-    - FULL mode now uses ONLY the “Mailing Address” column. Headquarters/HQ Location/etc. are ignored.
+    - FULL mode now uses ONLY the “Mailing Address” column. HQ-style fields are ignored.
     - If “Mailing Address” is missing, the app falls back to the 4-part address (street/city/state/zip) if available.
+    - We show both the original input address and Google’s formatted address; parts are backfilled when possible.
     - `eligible_rbs = True` means the point is **not** inside an RBS ineligible polygon.
     """)
