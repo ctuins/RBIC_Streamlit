@@ -55,11 +55,6 @@ ALIASES.update({
 
     # full-address fields -> unified name
     "mailing address": "address_full",
-    "headquarters": "address_full",
-    "hq address": "address_full",
-    "location": "address_full",
-    "full address": "address_full",
-    "hq location": "address_full",
 
     # optional metadata
     "hq country/territory/region": "country",
