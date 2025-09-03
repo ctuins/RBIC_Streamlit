@@ -12,39 +12,29 @@ USDA_LAYER_RBS = 2                 # layer 2 = RBS ineligible polygons
 TIMEOUT = 25
 SLEEP_ON_LIMIT = 2.0
 
-# Allow a single full-address column instead of parts
-FULL_ADDRESS_CANDIDATES = [
-    # Grata
-    "mailing address"
-]
-
-# Base aliases
+# IMPORTANT: Full-address mode will ONLY use "Mailing Address"
+# No HQ fields are considered as full address.
+# (HQ Address Line 1, etc. are still accepted as "parts" if present.)
 ALIASES = {
     # company/name
     "company": "company",
     "company name": "company", "company_name": "company", "business": "company",
     "business name": "company", "firm": "company", "organization": "company",
     "organisation": "company", "org": "company", "client": "company", "customer": "company",
-
-    # address parts
-    "address": "street", "address1": "street", "addr": "street", "street address": "street",
-    "address line 1": "street",
-
-    # zip/state variants
-    "zipcode": "zip", "zip_code": "zip", "postal": "zip", "postal_code": "zip", "province": "state",
-}
-
-# Extend aliases for Grata + PitchBook
-ALIASES.update({
-    # ids / names / links
-    "company id": "id",
     "companies": "company",
     "name": "company",
+
+    # ids / links / misc
+    "company id": "id",
     "website": "domain",
     "view company online": "source_link",
     "grata link": "source_link",
 
-    # PitchBook parts
+    # classic address parts
+    "address": "street", "address1": "street", "addr": "street", "street address": "street",
+    "address line 1": "street",
+
+    # pitchbook parts (still treated as parts, not full)
     "hq address line 1": "street",
     "hq city": "city",
     "hq state/province": "state",
@@ -53,13 +43,14 @@ ALIASES.update({
     "hq postcode": "zip",
     "hq postal code": "zip",
 
-    # full-address fields -> unified name
-    "mailing address": "address_full",
+    # zip/state variants
+    "zipcode": "zip", "zip_code": "zip", "postal": "zip", "postal_code": "zip", "province": "state",
 
-    # optional metadata
-    "hq country/territory/region": "country",
-    "primary industry code": "industry_code",
-})
+    # FULL MODE: ONLY mailing address is allowed as full-address
+    "mailing address": "address_full",
+    # NOTE: intentionally NOT mapping any of these to full:
+    # "headquarters", "hq address", "hq location", "location", "full address"
+}
 
 st.set_page_config(page_title="USDA RBS Eligibility Checker", layout="wide")
 st.title("USDA RBS Eligibility Checker")
@@ -74,51 +65,34 @@ def _canon(name: str) -> str:
     k = str(name).strip().lower()
     return ALIASES.get(k, k)
 
-def _coalesce_str(series: pd.Series) -> pd.Series:
-    return series.astype(str).replace({"<NA>": "", "nan": "", "None": None}).fillna("").str.strip()
+def _norm_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+         .replace({"<NA>": "", "nan": "", "None": None})
+         .fillna("")
+         .str.replace(r"\s+", " ", regex=True)
+         .str.strip()
+    )
 
 def _first_nonempty_rowwise(df_sub: pd.DataFrame) -> pd.Series:
     """Take first non-empty value per row across given columns; returns a Series."""
     if df_sub.shape[1] == 0:
         return pd.Series([""] * len(df_sub), index=df_sub.index)
-    norm = df_sub.apply(lambda s: s.astype(str).str.strip())
-    return norm.apply(lambda row: next((v for v in row if v not in ("", "nan", "None")), ""), axis=1)
+    norm = df_sub.apply(_norm_series)
+    return norm.apply(lambda row: next((v for v in row if v != ""), ""), axis=1)
 
 @st.cache_data(show_spinner=False)
 def _load_excel(bytes_) -> pd.DataFrame:
     df = pd.read_excel(io.BytesIO(bytes_), dtype=str, engine="openpyxl")
     df.columns = [_canon(c) for c in df.columns]
 
-    # Coalesce duplicates that canonicalized to the same name (so we always have Series, not DataFrames)
-    for key in ["address_full", "street", "city", "state", "zip", "company", "id"]:
-        dup_cols = [c for c in df.columns if c == key]
-        if len(dup_cols) > 1:
-            s = _first_nonempty_rowwise(df.loc[:, dup_cols])
-            df.drop(columns=dup_cols, inplace=True)
+    # Coalesce duplicates so each canonical name is a Series (prevents .str errors)
+    for key in ["company","id","street","city","state","zip","address_full"]:
+        dup = [c for c in df.columns if c == key]
+        if len(dup) > 1:
+            s = _first_nonempty_rowwise(df.loc[:, dup])
+            df.drop(columns=dup, inplace=True)
             df[key] = s
-
-    cols = set(df.columns)
-
-    # Prefer non-empty address_full if present; else promote a candidate
-    has_full_col = ("address_full" in cols) and _coalesce_str(df["address_full"]).ne("").any()
-    if not has_full_col:
-        for cand in FULL_ADDRESS_CANDIDATES:
-            if cand in cols and _coalesce_str(df[cand]).ne("").any():
-                df["address_full"] = df[cand]
-                has_full_col = True
-                break
-
-    # If neither full nor parts exist -> helpful error
-    required_parts = {"street", "city", "state", "zip"}
-    has_parts = required_parts.issubset(set(df.columns))
-    if not (has_full_col or has_parts):
-        present = ", ".join(df.columns)
-        raise ValueError(
-            "Could not find address columns. Provide either: "
-            "(1) columns street, city, state, zip; or "
-            "(2) a single full-address column (e.g., 'Headquarters', 'Mailing Address', or 'HQ Location'). "
-            f"Present columns: [{present}]"
-        )
 
     # Ensure optional
     if "id" not in df.columns:
@@ -126,13 +100,14 @@ def _load_excel(bytes_) -> pd.DataFrame:
     if "company" not in df.columns:
         df["company"] = ""
 
-    # Derive/normalize ZIP (not strictly required in full-address mode)
+    # Normalize key columns if present
+    for c in ["street","city","state","zip","address_full"]:
+        if c in df.columns:
+            df[c] = _norm_series(df[c])
+
+    # Derive/normalize ZIP (not strictly required in full mode, but helpful)
     if "zip" in df.columns:
-        df["zip"] = _coalesce_str(df["zip"]).str.extract(r"(\d{5})", expand=False)
-    elif has_full_col:
-        df["zip"] = _coalesce_str(df["address_full"]).str.extract(r"(\d{5})", expand=False)
-    else:
-        df["zip"] = np.nan
+        df["zip"] = df["zip"].str.extract(r"(\d{5})", expand=False)
 
     return df.reset_index(drop=True)
 
@@ -158,8 +133,7 @@ def google_geocode(address: str):
             else:
                 return None
         except Exception:
-            if attempt == 5:
-                return None
+            if attempt == 5: return None
             time.sleep(0.5 * attempt)
     return None
 
@@ -187,16 +161,15 @@ def usda_in_ineligible(lon: float, lat: float, layer_id: int = USDA_LAYER_RBS) -
 upload = st.file_uploader(
     "Upload Excel (.xlsx)",
     type=["xlsx"],
-    help="Provide street/city/state/zip OR a single full-address column (Headquarters/Mailing Address/HQ Location)."
+    help="Provide street/city/state/zip OR a single 'Mailing Address' column (full-address mode)."
 )
 run = st.button("Process file", type="primary")
 
 if run:
     if upload is None:
         st.warning("Please upload an .xlsx file first."); st.stop()
-
     if not API_KEY:
-        st.error("GOOGLE_MAPS_API_KEY is not set. Add it in the app’s Settings → Secrets and rerun."); st.stop()
+        st.error("GOOGLE_MAPS_API_KEY is not set. Add it in Settings → Secrets and rerun."); st.stop()
 
     with st.spinner("Processing…"):
         try:
@@ -204,34 +177,37 @@ if run:
         except Exception as e:
             st.error(str(e)); st.stop()
 
-        # Ensure expected columns exist even in full-address mode (for consistent outputs)
+        # Ensure expected columns exist (for consistent output)
         for col in ["street", "city", "state", "zip"]:
             if col not in df.columns:
                 df[col] = ""
 
-        # ---------- Build full_address FIRST ----------
-        has_address_full = ("address_full" in df.columns) and _coalesce_str(df["address_full"]).ne("").any()
-        if has_address_full:
-            df["full_address"] = _coalesce_str(df["address_full"])
-            mode = "full"
-        elif all(c in df.columns for c in ["street", "city", "state", "zip"]):
-            street_s = _coalesce_str(df["street"])
-            city_s   = _coalesce_str(df["city"])
-            state_s  = _coalesce_str(df["state"])
-            zip_s    = _coalesce_str(df["zip"]).str.extract(r"(\d{5})", expand=False).fillna("")
-            df["full_address"] = (street_s + ", " + city_s + ", " + state_s + " " + zip_s).str.strip()
+        # ---------- Build full_address using ONLY mailing address if provided ----------
+        has_full = ("address_full" in df.columns) and df["address_full"].str.strip().ne("").any()
+        if has_full:
+            # Use mailing address as the full address string
+            df["full_address"] = df["address_full"].str.replace(r"[\r\n]+", ", ", regex=True).str.strip()
+            mode = "full"   # mailing-address-only full mode
+        elif all(c in df.columns for c in ["street","city","state","zip"]):
+            # Fallback to parts mode
+            zip_s = df["zip"].astype(str).str.extract(r"(\d{5})", expand=False).fillna("")
+            df["full_address"] = (
+                df["street"].astype(str).str.strip() + ", " +
+                df["city"].astype(str).str.strip() + ", " +
+                df["state"].astype(str).str.strip() + " " +
+                zip_s
+            ).str.strip()
             mode = "parts"
         else:
-            st.error("Cannot construct full_address; missing both full-address and parts."); st.stop()
+            st.error("Could not find a 'Mailing Address' column or the 4 parts (street/city/state/zip)."); st.stop()
 
         # ---------- Validation depends on mode ----------
         if mode == "full":
-            # Only require 'full_address' to be non-empty
             bad_mask = df["full_address"].astype(str).str.strip().eq("")
-        else:  # parts mode
-            required_per_row = ["street", "city", "state", "zip"]
-            missing_mask = df[required_per_row].isna()
-            blank_mask = df[required_per_row].apply(lambda s: s.fillna("").astype(str).str.strip().eq(""))
+        else:
+            req = ["street","city","state","zip"]
+            missing_mask = df[req].isna()
+            blank_mask = df[req].apply(lambda s: s.fillna("").astype(str).str.strip().eq(""))
             bad_mask = missing_mask.any(axis=1) | blank_mask.any(axis=1)
 
         df_bad = df.loc[bad_mask].copy()
@@ -240,22 +216,25 @@ if run:
         if len(df_bad) > 0:
             st.warning(
                 f"{len(df_bad)} row(s) are missing required address info for this mode ({mode}). "
-                "They’ll be skipped here. Download to fix and re-upload."
+                "They’ll be skipped. Download to fix and re-upload."
             )
-            bad_csv = df_bad.to_csv(index=False).encode()
-            st.download_button("Download problematic rows (CSV)", data=bad_csv,
-                               file_name="rows_to_fix.csv", mime="text/csv")
+            st.download_button(
+                "Download problematic rows (CSV)",
+                data=df_bad.to_csv(index=False).encode(),
+                file_name="rows_to_fix.csv",
+                mime="text/csv",
+            )
 
         # Work with good rows
         df = df_good.reset_index(drop=True)
 
-        # Prep derived columns
+        # Prepare output fields
         df["geocode_success"] = False
         df["lon"] = np.nan
         df["lat"] = np.nan
         df["eligible_rbs"] = None
 
-        # Debug view
+        # Debug panel
         with st.expander("Detected columns (debug)"):
             st.write({"mode": mode})
             st.write(sorted(df.columns))
@@ -283,7 +262,7 @@ if run:
             except Exception:
                 df.at[i, "eligible_rbs"] = None
 
-        # Output columns
+        # Output columns (ensure present)
         out_cols = ["id","company","street","city","state","zip","lon","lat","geocode_success","eligible_rbs"]
         for c in out_cols:
             if c not in df.columns:
@@ -305,23 +284,15 @@ if run:
         csv_bytes = df[out_cols].to_csv(index=False).encode()
         xlsx_buf = io.BytesIO(); df[out_cols].to_excel(xlsx_buf, index=False)
 
-        st.download_button(
-            "Download CSV",
-            data=csv_bytes,
-            file_name=f"usda_rbs_google_{stamp}.csv",
-            mime="text/csv",
-        )
-        st.download_button(
-            "Download XLSX",
-            data=xlsx_buf.getvalue(),
-            file_name=f"usda_rbs_google_{stamp}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        st.download_button("Download CSV", data=csv_bytes,
+                           file_name=f"usda_rbs_google_{stamp}.csv", mime="text/csv")
+        st.download_button("Download XLSX", data=xlsx_buf.getvalue(),
+                           file_name=f"usda_rbs_google_{stamp}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 with st.expander("About & caveats"):
     st.write("""
-    - Geocoding uses Google Maps Geocoding API. Set `GOOGLE_MAPS_API_KEY` in the app’s **Settings → Secrets**.
+    - FULL mode now uses ONLY the “Mailing Address” column. Headquarters/HQ Location/etc. are ignored.
+    - If “Mailing Address” is missing, the app falls back to the 4-part address (street/city/state/zip) if available.
     - `eligible_rbs = True` means the point is **not** inside an RBS ineligible polygon.
-    - Accepts classic 4-part addresses, Grata (Headquarters/Mailing Address), and PitchBook (HQ Location or HQ Address Line 1/City/State/Post Code).
-    - Validation adapts to the detected mode: full-address OR parts.
     """)
