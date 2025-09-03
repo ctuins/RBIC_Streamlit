@@ -228,6 +228,10 @@ if run:
         df["input_address"] = df["full_address"]
         df["formatted_address"] = ""  # filled after geocoding
 
+        # Additional fields for the US check
+        df["country_code"] = ""
+        df["outside_us"] = False
+
         # ---------- Validation depends on mode ----------
         if mode == "full":
             bad_mask = df["full_address"].astype(str).str.strip().eq("")
@@ -281,6 +285,11 @@ if run:
                 df.at[i, "geocode_success"] = True
                 df.at[i, "formatted_address"] = ll["formatted"]
 
+                # Country check
+                country_short = _comp(ll["components"], "country", short=True)
+                df.at[i, "country_code"] = country_short or ""
+                df.at[i, "outside_us"] = (country_short != "US")
+
                 # Backfill parts if they were blank (nice for full mode)
                 if not str(df.at[i, "city"]).strip():
                     df.at[i, "city"]  = _comp(ll["components"], "locality") or _comp(ll["components"], "sublocality")
@@ -299,30 +308,37 @@ if run:
         for i, r in df.iterrows():
             if not r["geocode_success"]:
                 continue
+
+            # NEW RULE: Outside the U.S. is automatically NOT eligible (True ineligible)
+            if bool(r["outside_us"]):
+                df.at[i, "eligible_rbs"] = False
+                continue
+
             try:
                 in_inel = usda_in_ineligible(r["lon"], r["lat"])
                 df.at[i, "eligible_rbs"] = (not in_inel)
             except Exception:
                 df.at[i, "eligible_rbs"] = None
 
-        # Output columns (now include input/formatted address)
+        # Output columns (now include input/formatted address and outside_us/country)
         out_cols = [
             "id","company",
             "input_address","formatted_address",
             "street","city","state","zip",
+            "country_code","outside_us",
             "lon","lat","geocode_success","eligible_rbs"
         ]
         for c in out_cols:
             if c not in df.columns:
-                df[c] = "" if c not in ["lon","lat","geocode_success","eligible_rbs"] else np.nan
+                df[c] = "" if c not in ["lon","lat","geocode_success","eligible_rbs","outside_us"] else np.nan
 
         # Metrics
         st.subheader("Results")
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1: st.metric("Rows processed", len(df))
         with c2: st.metric("Geocode OK", int(df["geocode_success"].sum()))
-        with c3: st.metric("Eligible", int((df["eligible_rbs"] == True).sum()))
-        with c4: st.metric("Ineligible", int((df["eligible_rbs"] == False).sum()))
+        with c3: st.metric("Eligible (USDA)", int((df["eligible_rbs"] == True).sum()))
+        with c4: st.metric("Ineligible / Outside US", int((df["eligible_rbs"] == False).sum()))
         with c5: st.metric("No result", int(len(df) - (df["eligible_rbs"] == True).sum() - (df["eligible_rbs"] == False).sum()))
 
         st.dataframe(df[out_cols], width='stretch')
@@ -340,8 +356,9 @@ if run:
 
 with st.expander("About & caveats"):
     st.write("""
-    - FULL mode now uses ONLY the “Mailing Address” column. HQ-style fields are ignored.
+    - FULL mode uses ONLY the “Mailing Address” column. HQ-style fields are ignored.
     - If “Mailing Address” is missing, the app falls back to the 4-part address (street/city/state/zip) if available.
     - We show both the original input address and Google’s formatted address; parts are backfilled when possible.
+    - **Outside the U.S. is automatically NOT eligible** (USDA eligibility applies only within the U.S.).
     - `eligible_rbs = True` means the point is **not** inside an RBS ineligible polygon.
     """)
